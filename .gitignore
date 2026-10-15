@@ -1,0 +1,4 @@
+node_modules/
+.cdp-profile*/
+.cdp-shots/
+.playwright-mcp/

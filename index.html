@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>鎏金象棋 · 吃子特效版</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='29' fill='%2327221b' stroke='%23d8b567' stroke-width='3'/%3E%3Ctext x='32' y='44' font-size='34' text-anchor='middle' fill='%23ecd6a2' font-family='serif' font-weight='bold'%3E%E5%B0%87%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="shell">
+  <header class="site-head">
+    <h1>鎏金象棋</h1>
+    <p class="subtitle">吃子有惊雷 · 落子生光华</p>
+  </header>
+
+  <main class="layout">
+    <section class="stage">
+      <canvas id="board" width="720" height="800" aria-label="中国象棋棋盘"></canvas>
+
+      <div id="toast" class="toast" aria-live="polite">将 军 ！</div>
+
+      <!-- 开局菜单 -->
+      <div id="menu" class="overlay">
+        <div class="panel menu-panel">
+          <div class="seal">象</div>
+          <h2>鎏金象棋</h2>
+          <p class="panel-sub">楚河汉界，一战倾城</p>
+          <div class="mode-grid">
+            <button id="start-pvp" class="mode-btn">
+              <span class="mode-ico two"><i class="r">红</i><i class="b">黑</i></span>
+              <span class="mode-name">双人对弈</span>
+              <span class="mode-desc">同屏手谈</span>
+            </button>
+            <button id="start-r" class="mode-btn">
+              <span class="mode-ico one r">帅</span>
+              <span class="mode-name">人机 · 执红</span>
+              <span class="mode-desc">红先，你主攻</span>
+            </button>
+            <button id="start-b" class="mode-btn">
+              <span class="mode-ico one b">将</span>
+              <span class="mode-name">人机 · 执黑</span>
+              <span class="mode-desc">玄机子先手</span>
+            </button>
+          </div>
+          <label class="level-row">
+            <span>电脑棋力</span>
+            <select id="menu-level">
+              <option value="1">新手（会犯错）</option>
+              <option value="2" selected>高手（三思）</option>
+              <option value="3">大师（深度推演）</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <!-- 终局 -->
+      <div id="over" class="overlay">
+        <div class="panel over-panel">
+          <h2 id="over-title" class="gold-text">红 方 胜</h2>
+          <p id="over-sub" class="panel-sub">绝杀无解</p>
+          <div class="over-actions">
+            <button id="over-again" class="btn primary">再来一局</button>
+            <button id="over-menu" class="btn ghost">返回菜单</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="card status-card">
+        <div class="turn-line">
+          <span id="turn-lamp" class="lamp red"></span>
+          <strong id="turn-text">红方行棋</strong>
+        </div>
+        <div id="material" class="material">子力均势</div>
+      </div>
+
+      <div class="card controls">
+        <button id="btn-undo" class="btn ghost">悔棋</button>
+        <button id="btn-restart" class="btn ghost">重开</button>
+        <button id="btn-menu" class="btn ghost">菜单</button>
+        <button id="btn-mute" class="btn ghost icon-btn" title="声音开关">♪</button>
+      </div>
+
+      <div class="card trays">
+        <div class="tray-row">
+          <span class="tray-label red-text">红方缴获</span>
+          <div id="tray-r" class="tray"></div>
+        </div>
+        <div class="tray-row">
+          <span class="tray-label gold-text">黑方缴获</span>
+          <div id="tray-b" class="tray"></div>
+        </div>
+        <label class="level-inline">
+          棋力
+          <select id="level-select">
+            <option value="1">新手</option>
+            <option value="2" selected>高手</option>
+            <option value="3">大师</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="card moves-card">
+        <h3>棋谱</h3>
+        <ol id="movelist"></ol>
+      </div>
+
+      <p class="hint">点击己子选棋，金点可走、红环可吃。吃子特效随攻击子而变：车斩剑气、马踏尘旋、炮轰烈焰、象裂翠玉田印、士挑斜路星芒、兵卒向前疾刺；破宫之时金龙坠世。</p>
+    </aside>
+  </main>
+</div>
+
+<script src="js/rules.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/fx.js"></script>
+<script src="js/game.js"></script>
+</body>
+</html>
