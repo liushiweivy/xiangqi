@@ -186,7 +186,23 @@ async function main() {
     await tap(cdp, 5, 4);
     await sleep(120);
     await tap(cdp, 4, 4);
-    await sleep(360); // 0.3s 落子动画结束时触发爆裂，抓扩散初期
+    // 攻击动画轮询：蓄力突进 -> 命中(fired) -> 顿帧/镜头冲击 -> 粒子爆裂
+    const saw = { cap: false, fired: false, hitstop: false, punch: false, maxFx: 0 };
+    for (let i = 0; i < 30; i++) {
+      const d = await evalJs(cdp, 'window.__xqDbg()');
+      saw.cap = saw.cap || d.cap;
+      saw.fired = saw.fired || d.fired;
+      saw.hitstop = saw.hitstop || d.hitstop > 0;
+      saw.punch = saw.punch || d.punch;
+      saw.maxFx = Math.max(saw.maxFx, d.fx);
+      await sleep(18);
+    }
+    console.log('攻击动画:', JSON.stringify(saw));
+    if (!saw.cap) throw new Error('未观察到吃子攻击动画段');
+    if (!saw.fired) throw new Error('未在 DASH_Q 触发命中爆裂');
+    if (!saw.hitstop) throw new Error('命中顿帧未触发');
+    if (!saw.punch) throw new Error('镜头冲击未触发');
+    if (saw.maxFx < 40) throw new Error('吃子粒子数异常: ' + saw.maxFx);
     await shot(cdp, 'shot-02-capture-fx.png');
     await sleep(230);
     await shot(cdp, 'shot-02b-capture-fx-spread.png');
@@ -241,12 +257,12 @@ async function main() {
     await clickDom(cdp, 'btn-menu');
     await sleep(200);
     await clickDom(cdp, 'start-b');
-    await sleep(2500); // 红方 AI 行首着
+    await sleep(3200); // 红方 AI 行首着（大师档墙钟 ~1.8s，留余量防 headless 抖动）
     s = await stateOf(cdp);
     console.log('执黑开局:', JSON.stringify(s));
     if (s.moves !== 1 || s.turn !== '黑方行棋') throw new Error('执黑 AI 未正常开棋');
     await clickDom(cdp, 'btn-undo');
-    await sleep(2500); // AI 重新行首着
+    await sleep(3200); // AI 重新行首着
     s = await stateOf(cdp);
     console.log('执黑悔棋后:', JSON.stringify(s));
     if (s.moves !== 1 || s.turn !== '黑方行棋' || s.overShown) {
@@ -256,9 +272,9 @@ async function main() {
 
     // 7) 三次重复局面判和：双方各跳马再跳回，两轮后局面第三次等于初始
     await cdp.send('Page.reload');
-    await sleep(700);
+    await sleep(900);
     await clickDom(cdp, 'start-pvp');
-    await sleep(300);
+    await sleep(350);
     const cycle = [
       [9, 1, 7, 2], // 红 马八进七
       [0, 1, 2, 2], // 黑 马2进3
@@ -268,12 +284,12 @@ async function main() {
     for (let round = 0; round < 2; round++) {
       for (const [fr, fc, tr, tc] of cycle) {
         await tap(cdp, fr, fc);
-        await sleep(70);
+        await sleep(90);
         await tap(cdp, tr, tc);
-        await sleep(340);
+        await sleep(400);
       }
     }
-    await sleep(900); // gameDraw 浮层 700ms
+    await sleep(1000); // gameDraw 浮层 700ms
     s = await stateOf(cdp);
     console.log('重复局面后:', JSON.stringify(s));
     if (!s.overShown || s.overTitle !== '和 棋') {

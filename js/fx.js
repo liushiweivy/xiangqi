@@ -786,5 +786,10 @@
     }
   }
 
-  global.XQFX = { Particles, Sound, TAU };
+  // 攻击子主色（突进光带/聚气环用），取各型调色板的高亮色
+  function captureColor(atkType) {
+    return (CAPTURE_CONF[atkType] || CAPTURE_CONF.p).pal[1];
+  }
+
+  global.XQFX = { Particles, Sound, TAU, captureColor };
 })(typeof window !== 'undefined' ? window : globalThis);

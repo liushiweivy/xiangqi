@@ -5,6 +5,7 @@
   'use strict';
 
   const R = window.XQRules;
+  const TAU = Math.PI * 2;
   const W = 720;
   const H = 800;
   const CELL = 76;
@@ -13,6 +14,14 @@
   const PX = (c) => X0 + c * CELL;
   const PY = (r) => Y0 + r * CELL;
   const PIECE_R = 31;
+
+  // 攻击动画时序（吃子一小段：蓄力 -> 突进 -> 命中顿帧）
+  const MOVE_DUR = 0.24;     // 普通走子
+  const CAP_DUR = 0.5;       // 吃子总时长
+  const WIND_Q = 0.16;       // 蓄力段占比
+  const DASH_Q = 0.6;        // 命中时刻占比（此瞬爆裂）
+  const HIT_STOP = 0.085;    // 命中顿帧（秒）
+  const HIT_STOP_K = 0.16;   // 吃将加长顿帧
 
   const canvas = document.getElementById('board');
   const ctx = canvas.getContext('2d');
@@ -40,6 +49,8 @@
     lastMove: null,
     checkedSide: null,
     slowmo: null,
+    hitstop: 0,            // 命中顿帧倒计时（实时秒，冻结 anim/fx）
+    punch: null,           // 镜头冲击 {x,y,t,dur,mag}
     reps: new Map(),      // 局面键 -> 出现次数（三次重复判和）
   };
 
@@ -224,7 +235,7 @@
   }
 
   // ---------- 棋子绘制 ----------
-  function drawPiece(p, x, y, scale, alpha, rot) {
+  function drawPiece(p, x, y, scale, alpha, rot, noShadow) {
     scale = scale == null ? 1 : scale;
     alpha = alpha == null ? 1 : alpha;
     rot = rot || 0;
@@ -234,11 +245,13 @@
     ctx.translate(x, y);
     ctx.rotate(rot);
 
-    // 落影
-    ctx.beginPath();
-    ctx.ellipse(2, 5, rad * 0.96, rad * 0.42, 0, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(0,0,0,.4)';
-    ctx.fill();
+    // 落影（腾空动画时由调用方另画地面阴影）
+    if (!noShadow) {
+      ctx.beginPath();
+      ctx.ellipse(2, 5, rad * 0.96, rad * 0.42, 0, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(0,0,0,.4)';
+      ctx.fill();
+    }
 
     // 盘体
     const body = ctx.createRadialGradient(-rad * 0.32, -rad * 0.38, rad * 0.15, 0, 0, rad * 1.15);
@@ -310,6 +323,8 @@
     state.lastMove = null;
     state.checkedSide = null;
     state.slowmo = null;
+    state.hitstop = 0;
+    state.punch = null;
     state.reps = new Map();
     state.reps.set(positionKey(state.board, 'r'), 1);
     fx.clear();
@@ -366,11 +381,37 @@
       move: m,
       note: R.notation(state.board, m, state.turn),
     });
-    state.anim = { m, piece: mover, victim, t: 0, dur: victim ? 0.3 : 0.22 };
+    if (victim) {
+      const cf = attackConf(mover.t);
+      state.anim = {
+        m, piece: mover, victim, t: 0,
+        dur: cf.dur, cap: true, fired: false,
+        windQ: cf.wind, dashQ: cf.dash,
+      };
+    } else {
+      state.anim = { m, piece: mover, victim: null, t: 0, dur: MOVE_DUR, cap: false, fired: false };
+    }
     state.board[m.fr][m.fc] = null;
     if (victim) state.board[m.tr][m.tc] = null;
     state.selected = null;
     state.targets = [];
+  }
+
+  // 命中一瞬：爆裂特效 + 顿帧 + 镜头冲击（在动画 DASH_Q 处触发一次）
+  function fireImpact(a) {
+    const m = a.m;
+    a.fired = true;
+    const x = PX(m.tc), y = PY(m.tr);
+    try {
+      fx.burstCapture(x, y, a.piece.t, R.NAMES[a.victim.side][a.victim.t],
+        a.victim.side, { x: m.tc - m.fc, y: m.tr - m.fr });
+      sound.capture(a.piece.t);
+    } catch (err) {
+      console.error('[xiangqi] fx error:', err);
+    }
+    const royal = a.victim.t === 'k';
+    state.hitstop = royal ? HIT_STOP_K : HIT_STOP;
+    state.punch = { x, y, t: 0, dur: royal ? 0.5 : 0.34, mag: royal ? 0.09 : 0.05 };
   }
 
   function finalizeAnim() {
@@ -379,21 +420,309 @@
     state.anim = null; // 先清空：特效即便抛错也不得每帧重复触发
     state.board[m.tr][m.tc] = a.piece;
     state.lastMove = m;
-    const x = PX(m.tc), y = PY(m.tr);
-    try {
-      if (a.victim) {
-        fx.burstCapture(x, y, a.piece.t, R.NAMES[a.victim.side][a.victim.t],
-          a.victim.side, { x: m.tc - m.fc, y: m.tr - m.fr });
-        sound.capture(a.piece.t);
-      } else {
+    if (!a.cap) {
+      const x = PX(m.tc), y = PY(m.tr);
+      try {
         fx.burstMove(x, y, a.piece.side);
         sound.move();
+      } catch (err) {
+        console.error('[xiangqi] fx error:', err);
       }
-    } catch (err) {
-      console.error('[xiangqi] fx error:', err);
     }
     state.turn = R.OTHER[state.turn];
     afterTurn();
+  }
+
+  // 吃子动画进程：蓄力（回拉微缩）-> 突进（加速冲刺）-> 命中（顿帧回弹）
+  // 各子型吃子演出时序：wind=蓄力段占比，dash=命中时刻占比
+  const ATTACK_CONF = {
+    r: { dur: 0.42, wind: 0.07, dash: 0.36 }, // 车：快如闪电
+    h: { dur: 0.56, wind: 0.14, dash: 0.6 },  // 马：跃起踩踏
+    c: { dur: 0.62, wind: 0.24, dash: 0.7 },  // 炮：发射炮弹
+    p: { dur: 0.46, wind: 0.14, dash: 0.48 }, // 兵：长矛突刺
+  };
+  const DEFAULT_ATTACK = { dur: CAP_DUR, wind: WIND_Q, dash: DASH_Q };
+  const attackConf = (t) => ATTACK_CONF[t] || DEFAULT_ATTACK;
+
+  const settleK = (q, d, rate) => 1 - Math.exp(-Math.min(1, (q - d) / (1 - d)) * rate);
+
+  // 攻击棋子本体运动（e=路径进度，s=缩放，lift=腾空/向上为负，alpha=渐显）
+  function actorMotion(a, q) {
+    const w = a.windQ, d = a.dashQ, t = a.piece.t;
+    if (t === 'r') { // 车：极短蓄力 -> 闪电突刺
+      if (q < w) { const k = q / w; return { e: -0.06 * k, s: 1 - 0.04 * k, lift: 0 }; }
+      if (q < d) { const k = (q - w) / (d - w); return { e: k * k, s: 0.96 + 0.12 * k, lift: -3 * Math.sin(k * Math.PI) }; }
+      const set = settleK(q, d, 6);
+      return { e: 1, s: 1.22 * (1 - set) + set, lift: 0 };
+    }
+    if (t === 'h') { // 马：小幅后撤 -> 抛物线高高跃起（水平匀速）-> 砸落
+      if (q < w) { const k = q / w; return { e: -0.1 * k, s: 0.98 - 0.06 * k, lift: 0 }; }
+      if (q < d) { const k = (q - w) / (d - w); return { e: k, s: 1, lift: -42 * Math.sin(k * Math.PI) }; }
+      const set = settleK(q, d, 5);
+      return { e: 1, s: 1.18 * (1 - set) + set, lift: 0 };
+    }
+    if (t === 'c') { // 炮：本体原地后座蓄能，命中爆炸后金光瞬移到落点
+      if (q < w) { const k = q / w; return { e: -0.05 * k, s: 1 + 0.05 * k, lift: 0 }; }
+      if (q < d) return { e: -0.05, s: 1.05, lift: 0 };
+      const k = Math.min(1, (q - d) / (1 - d));
+      return { e: 1 - Math.pow(1 - k, 3), s: 0.35 + 0.9 * k, lift: 0, alpha: 0.35 + 0.65 * k };
+    }
+    if (t === 'p') { // 兵：压低身子 -> 挺矛突刺
+      if (q < w) { const k = q / w; return { e: -0.12 * k, s: 0.98 - 0.06 * k, lift: 0 }; }
+      if (q < d) { const k = (q - w) / (d - w); return { e: k * k, s: 0.94 + 0.1 * k, lift: -4 * Math.sin(k * Math.PI) }; }
+      const set = settleK(q, d, 5);
+      return { e: 1, s: 1.2 * (1 - set) + set, lift: 0 };
+    }
+    // 通用（象/士/将）：蓄力彗星突进
+    if (q < w) { const k = q / w; return { e: -0.14 * k, s: 0.98 - 0.08 * k, lift: 0 }; }
+    if (q < d) { const k = (q - w) / (d - w); return { e: k * k, s: 0.92 + 0.1 * k, lift: -5 * Math.sin(k * Math.PI) }; }
+    const set = settleK(q, d, 5);
+    return { e: 1, s: 1.24 * (1 - set) + set, lift: 0 };
+  }
+
+  // 吃子攻击段的画布特效：聚气收缩环 + 目标预警环 + 突进能量光带
+  // 蓄力段：攻击者脚下收缩光环 + 螺旋汇聚火星 + 径向辉光
+  function drawWindupFx(sx, sy, col, k) {
+    const ringR = 54 - 30 * k;
+    ctx.globalAlpha = 0.95 * (1 - k * 0.3);
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 4;
+    ctx.shadowColor = col;
+    ctx.shadowBlur = 14;
+    ctx.beginPath();
+    ctx.arc(sx, sy, ringR, 0, TAU);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    for (let i = 0; i < 8; i++) {
+      const ang = (i / 8) * TAU + k * 2.2;
+      const rr = ringR + 12 - 14 * k;
+      ctx.globalAlpha = 0.9 * (1 - k * 0.4);
+      ctx.fillStyle = '#fff0b8';
+      ctx.beginPath();
+      ctx.arc(sx + Math.cos(ang) * rr, sy + Math.sin(ang) * rr, 2.6, 0, TAU);
+      ctx.fill();
+    }
+    const g = ctx.createRadialGradient(sx, sy, 4, sx, sy, 58);
+    g.addColorStop(0, 'rgba(255,246,216,.95)');
+    g.addColorStop(1, 'rgba(255,200,120,0)');
+    ctx.globalAlpha = 0.55 * (1 - k * 0.25);
+    ctx.fillStyle = g;
+    ctx.fillRect(sx - 58, sy - 58, 116, 116);
+  }
+
+  const segPoint = (sx, sy, tx, ty, f) => [sx + (tx - sx) * f, sy + (ty - sy) * f];
+
+  // 突进段顶层光带：压在棋子身上，尖端超前先撞目标；命中后短暂残留
+  function drawDashTrail(q, e, w, d, sx, sy, tx, ty, col, opts) {
+    opts = opts || {};
+    let alpha = 0;
+    const maxA = opts.maxA == null ? 0.9 : opts.maxA;
+    if (q >= w && q < d) {
+      alpha = maxA * (q - w) / (d - w);
+    } else if (q >= d) {
+      alpha = maxA * Math.max(0, 1 - (q - d) / (opts.fade || 0.18));
+    }
+    if (alpha <= 0.02 || e <= 0) return;
+    const lead = opts.lead == null ? 0.16 : opts.lead;
+    const [x0, y0] = segPoint(sx, sy, tx, ty, Math.max(0, e - (opts.tail || 0.5)));
+    const [x1, y1] = segPoint(sx, sy, tx, ty, Math.min(1, e + lead));
+    ctx.globalAlpha = alpha * 0.8;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = col;
+    ctx.lineWidth = opts.w || 15;
+    ctx.shadowColor = col;
+    ctx.shadowBlur = opts.blur == null ? 24 : opts.blur;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(255,250,235,.95)';
+    ctx.lineWidth = opts.coreW || 5;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+  }
+
+  // 车：闪电突刺——主光带外再叠 3 道错位高速残影线
+  function drawRookStreak(q, e, w, d, sx, sy, tx, ty, col) {
+    drawDashTrail(q, e, w, d, sx, sy, tx, ty, col, { w: 17, blur: 30, tail: 0.7, fade: 0.14 });
+    let alpha = 0;
+    if (q >= w && q < d) alpha = (q - w) / (d - w);
+    else if (q >= d) alpha = Math.max(0, 1 - (q - d) / 0.1);
+    if (alpha <= 0.02 || e <= 0) return;
+    const dx = tx - sx, dy = ty - sy;
+    const L = Math.hypot(dx, dy) || 1;
+    const nx = -dy / L, ny = dx / L; // 路径法向
+    ctx.lineCap = 'round';
+    for (let i = -1; i <= 1; i++) {
+      const off = i * 13 + (i === 0 ? 0 : Math.sin(q * 70) * 2);
+      const f0 = Math.max(0, e - 0.62), f1 = Math.min(1, e + 0.04);
+      const [x0, y0] = segPoint(sx, sy, tx, ty, f0);
+      const [x1, y1] = segPoint(sx, sy, tx, ty, f1);
+      ctx.globalAlpha = alpha * 0.55;
+      ctx.strokeStyle = i === 0 ? '#ffffff' : col;
+      ctx.lineWidth = i === 0 ? 3 : 2;
+      ctx.beginPath();
+      ctx.moveTo(x0 + nx * off, y0 + ny * off);
+      ctx.lineTo(x1 + nx * off, y1 + ny * off);
+      ctx.stroke();
+    }
+  }
+
+  // 兵：长矛突刺——金杆 + 矛尖，突进段快速刺出
+  function drawSpear(q, w, d, sx, sy, tx, ty, col, e) {
+    if (q < w || e <= 0) return;
+    const k = q < d ? (q - w) / (d - w) : 1;
+    const stab = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+    const dx = tx - sx, dy = ty - sy;
+    const L = Math.hypot(dx, dy) || 1;
+    const ux = dx / L, uy = dy / L;
+    const reach = 26 + 30 * stab;
+    const tip = [sx + ux * (L * e + reach), sy + uy * (L * e + reach)];
+    const base = [tip[0] - ux * (reach + 16), tip[1] - uy * (reach + 16)];
+    ctx.globalAlpha = 0.95;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 4;
+    ctx.shadowColor = col;
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(base[0], base[1]);
+    ctx.lineTo(tip[0], tip[1]);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    const px = -uy, py = ux;
+    ctx.fillStyle = '#fff6d8';
+    ctx.beginPath();
+    ctx.moveTo(tip[0] + ux * 11, tip[1] + uy * 11);
+    ctx.lineTo(tip[0] + px * 5, tip[1] + py * 5);
+    ctx.lineTo(tip[0] - ux * 3, tip[1] - uy * 3);
+    ctx.lineTo(tip[0] - px * 5, tip[1] - py * 5);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // 炮：炮膛蓄能火球（围绕炮身）
+  function drawCannonCharge(q, w, d, sx, sy, col) {
+    if (q < w || q >= d) return;
+    const k = (q - w) / (d - w);
+    const flick = 0.8 + 0.2 * Math.sin(q * 60);
+    const r = 12 + 14 * k;
+    const g = ctx.createRadialGradient(sx, sy, 1, sx, sy, r + 14);
+    g.addColorStop(0, 'rgba(255,246,200,' + (0.95 * flick) + ')');
+    g.addColorStop(0.5, 'rgba(255,170,60,' + (0.6 * flick) + ')');
+    g.addColorStop(1, 'rgba(255,120,30,0)');
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = g;
+    ctx.fillRect(sx - r - 14, sy - r - 14, (r + 14) * 2, (r + 14) * 2);
+    ctx.globalAlpha = 0.9 * flick;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(sx, sy, r + 3, 0, TAU);
+    ctx.stroke();
+  }
+
+  // 炮：出膛闪光（命中前一瞬）
+  function drawMuzzle(q, w, d, sx, sy) {
+    const mk = (q - (d - 0.07)) / 0.07;
+    if (mk <= 0 || mk > 1) return;
+    ctx.globalAlpha = 1 - mk;
+    const g = ctx.createRadialGradient(sx, sy, 1, sx, sy, 26 + 14 * mk);
+    g.addColorStop(0, 'rgba(255,255,235,1)');
+    g.addColorStop(0.6, 'rgba(255,200,90,.7)');
+    g.addColorStop(1, 'rgba(255,150,40,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(sx - 42, sy - 42, 84, 84);
+  }
+
+  // 炮：飞行的炮弹 + 余焰（顶层）
+  function drawShell(q, w, d, sx, sy, tx, ty, col) {
+    if (q < w || q >= d) return;
+    const k = (q - w) / (d - w);
+    const [x, y] = segPoint(sx, sy, tx, ty, k);
+    for (let i = 1; i <= 5; i++) {
+      const [ex, ey] = segPoint(sx, sy, tx, ty, Math.max(0, k - i * 0.035));
+      ctx.globalAlpha = 0.55 - i * 0.09;
+      ctx.fillStyle = i <= 2 ? '#ffe9a8' : col;
+      ctx.beginPath();
+      ctx.arc(ex, ey, 5.5 - i * 0.7, 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.shadowColor = '#ffcf6a';
+    ctx.shadowBlur = 22;
+    const g = ctx.createRadialGradient(x - 1.5, y - 1.5, 0.5, x, y, 7);
+    g.addColorStop(0, '#ffffff');
+    g.addColorStop(0.55, '#ffd98a');
+    g.addColorStop(1, '#ff8a30');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, 6.5, 0, TAU);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  // 马：沿抛物线的金色蹄尘点（不用彗星光带）
+  function drawHorseArc(q, w, d, sx, sy, tx, ty, col) {
+    if (q < w || q >= d) return;
+    const k = (q - w) / (d - w);
+    for (let i = 1; i <= 8; i++) {
+      const kk = k - i * 0.05;
+      if (kk <= 0) continue;
+      const [x, y] = segPoint(sx, sy, tx, ty, kk);
+      ctx.globalAlpha = 0.4 * (1 - i / 9);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(x, y - 42 * Math.sin(kk * Math.PI), 3.4 - i * 0.24, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  // 命中前预警环：奶白普通环 / 马的重蹄琥珀大环
+  function drawWarnRing(tx, ty, k, heavy) {
+    ctx.globalAlpha = (heavy ? 1 : 0.95) - k * 0.4;
+    ctx.strokeStyle = heavy ? '#ffb84d' : '#fff3c4';
+    ctx.lineWidth = (heavy ? 7 : 5) * (1 - k) + (heavy ? 2.5 : 1.5);
+    ctx.shadowColor = heavy ? '#ff8a20' : '#ffd870';
+    ctx.shadowBlur = heavy ? 18 : 12;
+    ctx.beginPath();
+    ctx.arc(tx, ty, (heavy ? 24 : 20) + (heavy ? 30 : 24) * k, 0, TAU);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  // layer='top' 在主体棋子之后画（燃光压身），否则在棋子之前画底层
+  function drawCaptureFx(a, q, sx, sy, tx, ty, e, layer) {
+    const t = a.piece.t;
+    const col = window.XQFX.captureColor(t);
+    const w = a.windQ, d = a.dashQ;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    if (layer === 'top') {
+      if (t === 'r') drawRookStreak(q, e, w, d, sx, sy, tx, ty, col);
+      else if (t === 'p') {
+        drawDashTrail(q, e, w, d, sx, sy, tx, ty, col,
+          { w: 9, coreW: 3, blur: 16, tail: 0.35, maxA: 0.5, lead: 0.1 });
+        drawSpear(q, w, d, sx, sy, tx, ty, col, e);
+      } else if (t === 'c') drawShell(q, w, d, sx, sy, tx, ty, col);
+      else if (t === 'h') drawHorseArc(q, w, d, sx, sy, tx, ty, col);
+      else drawDashTrail(q, e, w, d, sx, sy, tx, ty, col);
+    } else {
+      if (q < w) drawWindupFx(sx, sy, col, q / w);
+      if (t === 'c') {
+        drawCannonCharge(q, w, d, sx, sy, col);
+        drawMuzzle(q, w, d, sx, sy);
+      }
+      const lead = t === 'h' ? 0.16 : 0.12; // 马跃起早给落点预警
+      const warn0 = d - lead;
+      if (q >= warn0 && q < d) {
+        drawWarnRing(tx, ty, (q - warn0) / (d - warn0), t === 'h');
+      }
+    }
+    ctx.restore();
   }
 
   function afterTurn() {
@@ -494,6 +823,8 @@
     state.selected = null;
     state.targets = [];
     state.slowmo = null;
+    state.hitstop = 0;
+    state.punch = null;
     rebuildReps();
     hideOverlays();
     const st = R.status(state.board, state.turn);
@@ -509,6 +840,14 @@
     ctx.clearRect(0, 0, W, H);
     ctx.save();
     ctx.translate(fx.shakeX || 0, fx.shakeY || 0);
+    // 命中镜头冲击：以受击点为中心短暂放大
+    if (state.punch) {
+      const pu = state.punch;
+      const k = pu.mag * Math.exp((-pu.t / pu.dur) * 6);
+      ctx.translate(pu.x, pu.y);
+      ctx.scale(1 + k, 1 + k);
+      ctx.translate(-pu.x, -pu.y);
+    }
     ctx.drawImage(boardLayer, 0, 0);
 
     // 上一步痕迹
@@ -573,18 +912,15 @@
       }
     }
 
-    // 被吃子（动画期间留在终点，受击前抖动）
-    if (state.anim && state.anim.victim) {
+    // 被吃子：命中前留在终点（受击瞬间一胀），命中后交给爆裂碎片
+    if (state.anim && state.anim.victim && !state.anim.fired) {
       const a = state.anim;
       const q = Math.min(1, a.t / a.dur);
-      let sc = 1, rot = 0, alpha = 1;
-      if (q > 0.72) {
-        const k = (q - 0.72) / 0.28;
-        sc = 1 + Math.sin(k * Math.PI) * 0.25;
-        rot = Math.sin(k * 40) * 0.06;
-        alpha = 1 - k * 0.35;
-      }
-      drawPiece(a.victim, PX(a.m.tc), PY(a.m.tr), sc, alpha, rot);
+      const braceQ = a.dashQ - 0.09;
+      const sc = q > braceQ
+        ? 1 + Math.sin(((q - braceQ) / (DASH_Q - braceQ)) * Math.PI) * 0.14
+        : 1;
+      drawPiece(a.victim, PX(a.m.tc), PY(a.m.tr), sc, 1, 0);
     }
 
     // 棋盘棋子（跳过动画格）
@@ -601,22 +937,58 @@
       }
     }
 
-    // 行动棋子（拖尾 + 插值）
+    // 行动棋子（吃子=各子型专属攻击演出；普通=小跳落子；均带残影与地面影）
+    const GHOST_CONF = { r: { n: 8, step: 0.02, a: 0.1 }, h: { n: 6, step: 0.034, a: 0.15 }, c: { n: 0 } };
     if (state.anim) {
       const a = state.anim;
       const q = Math.min(1, a.t / a.dur);
-      const e = 1 - Math.pow(1 - q, 3);
-      const x = PX(a.m.fc) + (PX(a.m.tc) - PX(a.m.fc)) * e;
-      const y = PY(a.m.fr) + (PY(a.m.tr) - PY(a.m.fr)) * e;
-      for (let i = 1; i <= 3; i++) {
-        const back = i * 0.05;
-        const qe = Math.max(0, e - back);
-        const tx = PX(a.m.fc) + (PX(a.m.tc) - PX(a.m.fc)) * qe;
-        const ty = PY(a.m.fr) + (PY(a.m.tr) - PY(a.m.fr)) * qe;
-        drawPiece(a.piece, tx, ty, 1 - i * 0.06, 0.16 - i * 0.04, 0);
+      const sx = PX(a.m.fc), sy = PY(a.m.fr), txp = PX(a.m.tc), typ = PY(a.m.tr);
+      let e, sc = 1, lift = 0, alpha = 1;
+      if (a.cap) {
+        const mo = actorMotion(a, q);
+        e = mo.e; sc = mo.s; lift = mo.lift; alpha = mo.alpha == null ? 1 : mo.alpha;
+        drawCaptureFx(a, q, sx, sy, txp, typ, e);
+      } else {
+        e = 1 - Math.pow(1 - q, 3);
+        lift = -Math.sin(Math.PI * q) * 14;
       }
-      const land = q > 0.9 ? 1 - (q - 0.9) / 0.1 : 1;
-      drawPiece(a.piece, x, y, 1 + (1 - land) * 0.12, 1, 0);
+      const gx = sx + (txp - sx) * e;
+      const gy = sy + (typ - sy) * e;
+
+      // 地面落影（腾空时独立于棋子，跳得越高影子越小越淡）
+      if (lift < -0.5) {
+        const sh = Math.max(0.45, 1 + lift * 0.014);
+        ctx.save();
+        ctx.globalAlpha = 0.42 * sh + 0.08;
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        ctx.ellipse(gx, gy + 7, PIECE_R * 0.92 * sh, PIECE_R * 0.4 * sh, 0, 0, TAU);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // 残影（炮瞬移无残影；车 8 道高速残影；马沿抛物线）
+      const gc = a.cap ? (GHOST_CONF[a.piece.t] || { n: 5, step: 0.032, a: 0.17 })
+        : { n: 3, step: 0, a: 0 };
+      for (let i = 1; i <= gc.n; i++) {
+        let gex, ges, geLift, galpha;
+        if (a.cap) {
+          const qb = q - i * gc.step;
+          if (qb < a.windQ) continue;
+          const mb = actorMotion(a, Math.max(0, qb));
+          gex = mb.e; ges = mb.s; geLift = mb.lift;
+          galpha = a.piece.t === 'r' ? Math.max(0.04, gc.a - i * 0.008) : gc.a;
+        } else {
+          gex = Math.max(0, e - i * 0.05); ges = 1;
+          geLift = -Math.sin(Math.PI * Math.min(1, gex)) * 14;
+          galpha = 0.16 - i * 0.04;
+        }
+        drawPiece(a.piece, sx + (txp - sx) * gex, sy + (typ - sy) * gex + geLift,
+          ges, galpha, 0, geLift < -0.5);
+      }
+
+      drawPiece(a.piece, gx, gy + lift, sc, alpha, 0, lift < -0.5);
+      if (a.cap) drawCaptureFx(a, q, sx, sy, txp, typ, e, 'top');
     }
 
     fx.render(ctx);
@@ -628,6 +1000,8 @@
   function tick(now) {
     const rawDt = Math.min(0.05, (now - lastT) / 1000);
     lastT = now;
+    // 测试用：冻结动画推进（拖帧截图），仍刷新 lastT 防解冻后 dt 跳变
+    if (window.__xqFreeze) return;
     let timeScale = 1;
     if (state.slowmo) {
       state.slowmo.t += rawDt;
@@ -635,10 +1009,21 @@
       timeScale = 0.25 + 0.75 * (q * q);
       if (q >= 1) state.slowmo = null;
     }
-    const dt = rawDt * timeScale;
+    let dt = rawDt * timeScale;
+    // 命中顿帧：冻结 anim/粒子推进，但镜头与计时仍走真实时间
+    if (state.hitstop > 0) {
+      state.hitstop = Math.max(0, state.hitstop - rawDt);
+      dt = 0;
+    }
+    if (state.punch) {
+      state.punch.t += rawDt;
+      if (state.punch.t >= state.punch.dur) state.punch = null;
+    }
     if (state.anim) {
       state.anim.t += dt;
-      if (state.anim.t >= state.anim.dur) finalizeAnim();
+      const a = state.anim;
+      if (a.cap && !a.fired && Math.min(1, a.t / a.dur) >= a.dashQ) fireImpact(a);
+      if (state.anim && state.anim.t >= state.anim.dur) finalizeAnim();
     }
     fx.update(dt);
     render(now / 1000);
@@ -793,4 +1178,66 @@
   el('menu').classList.add('show');
   renderPanels();
   requestAnimationFrame(frame);
+
+  // 调试 / CDP 冒烟钩子：观察攻击动画内部状态
+  window.__xqDbg = function () {
+    return {
+      anim: !!state.anim,
+      cap: !!(state.anim && state.anim.cap),
+      fired: !!(state.anim && state.anim.fired),
+      hitstop: state.hitstop,
+      punch: !!state.punch,
+      fx: fx.list.length,
+    };
+  };
+
+  // 测试用：在「红兵(5,4) 吃黑卒(4,4)」局面下把吃子动画拖到指定相位并同步渲染一帧
+  // q: 动画进度 0..1；fxAge: 命中后粒子额外推进秒数（用于爆裂扩散静帧）
+  // 测试用：摆一个极简吃子局面，把攻击动画拖到指定相位并同步渲染一帧
+  // kind: 'p' 兵刺 / 'r' 车闪 / 'h' 马踏 / 'c' 炮轰；q: 动画进度；fxAge: 粒子额外推进秒数
+  window.__xqScrubCapture = function (kind, q, fxAge) {
+    kind = kind || 'p';
+    const board = [];
+    for (let r = 0; r < 10; r++) board.push(new Array(9).fill(null));
+    const RP = (t) => ({ t, side: 'r', id: 't' + t });
+    const BP = (t) => ({ t, side: 'b', id: 'tb' + t });
+    // 无王局面 isInCheck 恒真，所有走法会被合法过滤；双王坐宫且被攻击线子隔开
+    board[9][4] = RP('k');
+    board[0][4] = BP('k');
+    let fr, fc, tr, tc;
+    if (kind === 'r') {
+      board[5][4] = RP('r'); board[4][4] = BP('p');
+      fr = 5; fc = 4; tr = 4; tc = 4;
+    } else if (kind === 'h') {
+      board[6][3] = RP('h'); board[4][4] = BP('p'); // (6,3)->(4,4) 日字，(5,3) 空不蹩腿
+      fr = 6; fc = 3; tr = 4; tc = 4;
+    } else if (kind === 'c') {
+      board[5][4] = RP('c'); board[4][4] = RP('p'); board[3][4] = BP('p'); // 隔山打牛
+      fr = 5; fc = 4; tr = 3; tc = 4;
+    } else {
+      board[5][4] = RP('p'); board[4][4] = BP('p');
+      fr = 5; fc = 4; tr = 4; tc = 4;
+    }
+    state.board = board;
+    state.turn = 'r';
+    state.anim = null;
+    state.hitstop = 0;
+    state.punch = null;
+    state.checkedSide = null;
+    state.selected = null;
+    state.targets = [];
+    const mv = R.movesFrom(board, 'r', fr, fc).find((x) => x.tr === tr && x.tc === tc && x.cap);
+    if (!mv) return { error: 'no capture move', kind };
+    fx.clear();
+    attemptMove(mv);
+    const a = state.anim;
+    a.t = Math.min(0.999, q) * a.dur;
+    if (q >= a.dashQ && !a.fired) fireImpact(a);
+    if (fxAge > 0) fx.update(fxAge);
+    render(performance.now() / 1000);
+    const dbg = window.__xqDbg();
+    dbg.kind = kind;
+    dbg.dashQ = a.dashQ;
+    return dbg;
+  };
 })();
